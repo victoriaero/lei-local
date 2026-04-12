@@ -1,0 +1,45 @@
+{
+  "seed": 420,
+  "NUM_GERACOES": 350,
+  "POPULACAO_INICIAL": 250,
+  "ELITISM": 1,
+  "PROB_MUTACAO": 0.95,
+  "PROB_CROSSOVER": 0.05,
+  "PIXEL_PERTURB_STD": 0.75,
+  "SIGMA_INIT": 1.0,
+  "SIGMA_LOCAL": 0.5,
+  "BATCH_EVAL_SIZE": 64,
+  "TARGET_CLASS": 2,
+  "TARGET_CLASS_NAME": "bird",
+  "P0": 0.9942446351051331,
+  "CIFAR10_CLASSES": {
+    "0": "airplane",
+    "1": "automobile",
+    "2": "bird",
+    "3": "cat",
+    "4": "deer",
+    "5": "dog",
+    "6": "frog",
+    "7": "horse",
+    "8": "ship",
+    "9": "truck"
+  },
+  "K_GRID": 25,
+  "N_SNAPSHOTS": 25,
+  "LATENT_SHAPE": [
+    4,
+    64,
+    64
+  ],
+  "VAE_MODEL": "stabilityai/sd-vae-ft-ema",
+  "CLASSIFIER": "nateraw/vit-base-patch16-224-cifar10",
+  "input_size": {
+    "height": 224,
+    "width": 224
+  },
+  "TRUST_REGION_RADIUS": 3.0,
+  "TRUST_REGION_PENALTY": 1.0,
+  "SENS_ALPHA_DELTA_P": 1.0,
+  "SENS_BETA_LAT_DIST": 0.1,
+  "INPUT_IMAGE_PATH": "image.jpg"
+}
