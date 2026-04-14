@@ -261,7 +261,7 @@ def main():
     all_predictions_path = OUTPUT_DIR / "cifar10_all_predictions.csv"
     correct_predictions_path = OUTPUT_DIR / "cifar10_correct_predictions.csv"
     grouped_path = OUTPUT_DIR / "cifar10_correct_grouped_by_confidence.csv"
-    selected_path = OUTPUT_DIR / "cifar10_selected_instances.csv"
+    selected_path = OUTPUT_DIR / "cifar10_selected_instances_representative_5.csv"
     representative_path = OUTPUT_DIR / "cifar10_selected_instances_representative_1.csv"
 
     df.to_csv(all_predictions_path, index=False)
