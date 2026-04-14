@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-import os
-import random
+import csv
 import datetime
+import hashlib
 import json
 import logging
-import csv
+import math
+import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-
+from diffusers import AutoencoderKL
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModelForImageClassification
-from diffusers import AutoencoderKL
 
-# ——— Seeds de Reprodutibilidade ———
+# --- Optional parquet support (preferred for large individual logs) ---
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+# --- Seeds de Reprodutibilidade ---
 seed = 420
 random.seed(seed)
 np.random.seed(seed)
@@ -25,17 +35,17 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
 # ===========================
-# 0. Preparação: AutoencoderKL 32×32 Genérico + Classificador CIFAR-10
+# 0. Preparação: AutoencoderKL 32x32 Genérico + Classificador CIFAR-10
 # ===========================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Carrega VAE genérico 32×32 (modelo DCAE 32×32 treinado em ImageNet)
+# Carrega VAE genérico 32x32 (modelo DCAE 32x32 treinado em ImageNet)
 VAE_MODEL_NAME = "stabilityai/sd-vae-ft-ema"
 vae = AutoencoderKL.from_pretrained(VAE_MODEL_NAME).to(DEVICE)
 vae.eval()
 VAE_SCALING_FACTOR = float(getattr(vae.config, "scaling_factor", 1.0))
 
-sample_size = int(vae.config.sample_size)         # deve ser 32
+sample_size = int(vae.config.sample_size)  # deve ser 32
 
 # Classificador CIFAR-10 pré-treinado
 MODEL_NAME = "nateraw/vit-base-patch16-224-cifar10"
@@ -63,16 +73,16 @@ print(f"Usando dispositivo: {DEVICE}")
 # ===========================
 # 1. Hiperparâmetros do GA
 # ===========================
-NUM_GERACOES      = 350
-POPULACAO_INICIAL = 120      # <<< reduzido para caber na GPU
+NUM_GERACOES = 200
+POPULACAO_INICIAL = 100
 
-ELITISM        = 1
-PROB_MUTACAO   = 0.95
+ELITISM = 1
+PROB_MUTACAO = 0.95
 PROB_CROSSOVER = 0.05
 
 PIXEL_PERTURB_STD = 0.30
 
-BATCH_EVAL_SIZE = 8          # <<< bem menor para reduzir pico de memória
+BATCH_EVAL_SIZE = 8
 
 K_GRID = 25
 n_cols = int(np.ceil(np.sqrt(K_GRID)))
@@ -87,22 +97,30 @@ SIGMA_INIT = 1.0
 # 1.1. Hiperparâmetros LEI-Local (Sensibilidade)
 # ===========================
 
-INPUT_IMAGE_PATH = "/scratch/samiramalaquias/ppsn/sapo.jpg"
+INPUT_IMAGE_PATH = "/scratch/victoria.estanislau/lei-local/src/aviao.jpg"
 
 TARGET_CLASS = -1  # -1 = usar classe predita automaticamente
 
 # Fase 1: antes de mudar de classe (empurrar margem para cima, mas com penalização de distância)
-MARGIN_ALPHA_BEFORE   = 1.0
-DIST_BETA_BEFORE      = 0.3
+MARGIN_ALPHA_BEFORE = 1.0
+DIST_BETA_BEFORE = 0.3
 
 # Fase 2: já mudou de classe (minimizar dist_norm e não inflar demais a margem)
-DIST_GAMMA_AFTER      = 2.0
-MARGIN_GAMMA_AFTER    = 0.2
+DIST_GAMMA_AFTER = 2.0
+MARGIN_GAMMA_AFTER = 0.2
 
-TRUST_REGION_RADIUS   = 1.0
-TRUST_REGION_PENALTY  = 2.0
+TRUST_REGION_RADIUS = 1.0
+TRUST_REGION_PENALTY = 2.0
 
 SIGMA_LOCAL = 0.20
+
+# ===========================
+# 1.2. Logging / Artefatos
+# ===========================
+
+SAVE_RECONSTRUCTION_PATH_IN_LOG = True
+SAVE_FULL_Z_VECTORS = False  # Se True, salva vetor completo em string JSON no log (pesado)
+Z_VECTOR_HEAD_SIZE = 16       # Alternativa compacta: primeiros N elementos
 
 # ===========================
 # 2. Funções de Conversão Latente em Lote
@@ -110,9 +128,11 @@ SIGMA_LOCAL = 0.20
 
 to_tensor_01 = transforms.ToTensor()
 
-def prepare_classifier_inputs(images) -> torch.Tensor:
+
+def prepare_classifier_inputs(images: Any) -> torch.Tensor:
     inputs = feature_extractor(images=images, return_tensors="pt")
     return inputs["pixel_values"].to(DEVICE)
+
 
 def latent_batch_to_pil(batch_z: torch.Tensor) -> list[Image.Image]:
     """
@@ -122,22 +142,22 @@ def latent_batch_to_pil(batch_z: torch.Tensor) -> list[Image.Image]:
     with torch.no_grad():
         recon = vae.decode(batch_z / VAE_SCALING_FACTOR).sample  # [B,3,32,32], [-1,+1]
     recon = (recon.clamp(-1, 1) + 1.0) / 2.0
-    recon_cpu = recon.cpu()   # <<< libera GPU logo depois
+    recon_cpu = recon.cpu()
 
-    pil_list = []
+    pil_list: list[Image.Image] = []
     to_pil_local = transforms.ToPILImage()
     for i in range(recon_cpu.shape[0]):
-        img_rgb = recon_cpu[i]      # [3,32,32] em CPU
+        img_rgb = recon_cpu[i]
         pil_32 = to_pil_local(img_rgb)
         pil = pil_32.resize((224, 224))
         pil_list.append(pil)
 
-    # libera tensores para GC
     del recon, recon_cpu
     return pil_list
 
+
 # ===========================
-# 2.1. Encode x0 → z0
+# 2.1. Encode x0 -> z0
 # ===========================
 
 def encode_image_to_latent(pil_img: Image.Image) -> torch.Tensor:
@@ -151,13 +171,15 @@ def encode_image_to_latent(pil_img: Image.Image) -> torch.Tensor:
 
     return z.squeeze(0)
 
-def get_latent_stats(z: torch.Tensor):
+
+def get_latent_stats(z: torch.Tensor) -> tuple[tuple[int, ...], int, float]:
     latent_shape = tuple(int(dim) for dim in z.shape)
     latent_dim = int(z.numel())
     latent_dim_sqrt = float(np.sqrt(latent_dim))
     return latent_shape, latent_dim, latent_dim_sqrt
 
-def get_classifier_logits_and_class(pil_img: Image.Image):
+
+def get_classifier_logits_and_class(pil_img: Image.Image) -> tuple[torch.Tensor, float, int]:
     x = prepare_classifier_inputs(pil_img)
 
     with torch.no_grad():
@@ -170,67 +192,108 @@ def get_classifier_logits_and_class(pil_img: Image.Image):
     pred_class = int(np.argmax(probs_np))
     p0 = float(probs_np[pred_class])
 
-    # libera tensores
     del logits, probs, x
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return logits0, p0, pred_class
 
+
 # ===========================
 # 3. Operadores Genéticos
 # ===========================
 
-def init_population_local(z0: torch.Tensor, size: int) -> list[torch.Tensor]:
-    pop = []
+@dataclass
+class Individual:
+    individual_id: int
+    z: torch.Tensor
+    created_by: str
+    parent_ids: str
+    mutation_sigma: Optional[float]
+    birth_generation: int
+
+
+def next_individual_id(counter: dict[str, int]) -> int:
+    counter["value"] += 1
+    return counter["value"]
+
+
+def init_population_local(z0: torch.Tensor, size: int, id_counter: dict[str, int]) -> list[Individual]:
+    pop: list[Individual] = []
     for _ in range(size):
         noise = torch.randn_like(z0) * SIGMA_LOCAL
-        pop.append((z0 + noise).to(DEVICE))
+        pop.append(
+            Individual(
+                individual_id=next_individual_id(id_counter),
+                z=(z0 + noise).to(DEVICE),
+                created_by="init",
+                parent_ids="",
+                mutation_sigma=float(SIGMA_LOCAL),
+                birth_generation=0,
+            )
+        )
     return pop
 
-def mutate_latent(z: torch.Tensor, gen: int) -> torch.Tensor:
-    fator = 0.05 + 0.95 * (1.0 - (gen - 1) / (NUM_GERACOES - 1))
-    max_std = PIXEL_PERTURB_STD * fator
-    std_rand = torch.rand(1, device=DEVICE).item() * max_std
-    noise = torch.randn_like(z) * std_rand
+
+def get_mutation_sigma(gen: int) -> float:
+    factor = 0.05 + 0.95 * (1.0 - (gen - 1) / (NUM_GERACOES - 1))
+    max_std = PIXEL_PERTURB_STD * factor
+    return torch.rand(1, device=DEVICE).item() * max_std
+
+
+def mutate_latent(z: torch.Tensor, sigma: float) -> torch.Tensor:
+    noise = torch.randn_like(z) * sigma
     return z + noise
 
-def crossover_latent(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-    α = torch.rand(1, device=DEVICE)
-    return α * z1 + (1.0 - α) * z2
 
-def tournament_selection(pop: list[torch.Tensor], fitness: np.ndarray, k: int = 2) -> torch.Tensor:
-    idxs = random.sample(range(len(pop)), k)
-    return pop[idxs[0]] if fitness[idxs[0]] >= fitness[idxs[1]] else pop[idxs[1]]
+def crossover_latent(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+    alpha = torch.rand(1, device=DEVICE)
+    return alpha * z1 + (1.0 - alpha) * z2
+
+
+def tournament_selection_index(pop_size: int, fitness: np.ndarray, k: int = 2) -> int:
+    idxs = random.sample(range(pop_size), k)
+    return idxs[0] if fitness[idxs[0]] >= fitness[idxs[1]] else idxs[1]
+
 
 # ===========================
 # 4. Fitness de Sensibilidade (duas fases)
 # ===========================
 
 def evaluate_fitness_sensitivity(
-    pop_z: list[torch.Tensor],
+    population: list[Individual],
     z0: torch.Tensor,
-    logits0: torch.Tensor,
     orig_class: int,
-    latent_dim_sqrt: float
-):
-    n = len(pop_z)
-    fitness          = np.zeros(n, dtype=np.float32)
-    margin_all       = np.zeros(n, dtype=np.float32)
-    dist_norm_all    = np.zeros(n, dtype=np.float32)
-    dist_raw_all     = np.zeros(n, dtype=np.float32)
-    p_orig_all       = np.zeros(n, dtype=np.float32)
-    p_other_max_all  = np.zeros(n, dtype=np.float32)
-    pred_class_all   = np.zeros(n, dtype=np.int32)
+    latent_dim_sqrt: float,
+) -> dict[str, np.ndarray]:
+    n = len(population)
+
+    metrics: dict[str, np.ndarray] = {
+        "fitness_total": np.zeros(n, dtype=np.float32),
+        "margin_logit": np.zeros(n, dtype=np.float32),
+        "dist_norm": np.zeros(n, dtype=np.float32),
+        "dist_l2": np.zeros(n, dtype=np.float32),
+        "prob_original_class": np.zeros(n, dtype=np.float32),
+        "prob_best_alt_class": np.zeros(n, dtype=np.float32),
+        "pred_class": np.zeros(n, dtype=np.int32),
+        "target_class_if_changed": np.full(n, -1, dtype=np.int32),
+        "logit_original": np.zeros(n, dtype=np.float32),
+        "logit_best_alt": np.zeros(n, dtype=np.float32),
+        "fitness_margin_term": np.zeros(n, dtype=np.float32),
+        "fitness_distance_penalty": np.zeros(n, dtype=np.float32),
+        "fitness_constraint_penalty": np.zeros(n, dtype=np.float32),
+        "constraint_violation": np.zeros(n, dtype=np.float32),
+        "within_confidence_region": np.zeros(n, dtype=np.int32),
+        "changed_class": np.zeros(n, dtype=np.int32),
+    }
 
     z0 = z0.to(DEVICE)
     z0_flat = z0.view(-1)
 
     for start in range(0, n, BATCH_EVAL_SIZE):
-        batch = pop_z[start: start + BATCH_EVAL_SIZE]
-        batch_z = torch.stack(batch, dim=0)  # [B, C, 8, 8]
+        batch_individuals = population[start: start + BATCH_EVAL_SIZE]
+        batch_z = torch.stack([ind.z for ind in batch_individuals], dim=0)
 
-        # --- decode & classificador ---
         pil_imgs = latent_batch_to_pil(batch_z)
         inputs = prepare_classifier_inputs(pil_imgs)
 
@@ -251,69 +314,550 @@ def evaluate_fitness_sensitivity(
         flat = batch_z.view(batch_z.size(0), -1)
         z0_batch = z0_flat.unsqueeze(0).expand_as(flat)
         diff = flat - z0_batch
-        dist_raw = torch.norm(diff, dim=1)
-        dist_norm = dist_raw / latent_dim_sqrt
+        dist_l2 = torch.norm(diff, dim=1)
+        dist_norm = dist_l2 / latent_dim_sqrt
         over_radius = torch.clamp(dist_norm - TRUST_REGION_RADIUS, min=0.0)
 
         pred_classes = torch.argmax(probs, dim=1)
         changed_mask = (pred_classes != orig_class).float()
-        same_mask    = 1.0 - changed_mask
+        same_mask = 1.0 - changed_mask
 
-        fitness_before = (
-            MARGIN_ALPHA_BEFORE * margin
-            - DIST_BETA_BEFORE   * dist_norm
-            - TRUST_REGION_PENALTY * over_radius
-        )
+        margin_term_before = MARGIN_ALPHA_BEFORE * margin
+        margin_term_after = -MARGIN_GAMMA_AFTER * torch.relu(margin)
+        margin_term = same_mask * margin_term_before + changed_mask * margin_term_after
 
-        fitness_after = (
-            - DIST_GAMMA_AFTER * dist_norm
-            - MARGIN_GAMMA_AFTER * torch.relu(margin)
-            - TRUST_REGION_PENALTY * over_radius
-        )
+        distance_penalty_before = DIST_BETA_BEFORE * dist_norm
+        distance_penalty_after = DIST_GAMMA_AFTER * dist_norm
+        distance_penalty = same_mask * distance_penalty_before + changed_mask * distance_penalty_after
 
-        batch_fitness = same_mask * fitness_before + changed_mask * fitness_after
+        constraint_penalty = TRUST_REGION_PENALTY * over_radius
+
+        batch_fitness = margin_term - distance_penalty - constraint_penalty
 
         bsz = batch_z.size(0)
         end = start + bsz
 
-        fitness[start:end]          = batch_fitness.cpu().numpy()
-        margin_all[start:end]       = margin.cpu().numpy()
-        dist_norm_all[start:end]    = dist_norm.cpu().numpy()
-        dist_raw_all[start:end]     = dist_raw.cpu().numpy()
-        p_orig_all[start:end]       = p_orig.cpu().numpy()
-        p_other_max_all[start:end]  = p_other_max.cpu().numpy()
-        pred_class_all[start:end]   = pred_classes.cpu().numpy().astype(np.int32)
+        pred_np = pred_classes.detach().cpu().numpy().astype(np.int32)
+        changed_np = (pred_np != orig_class).astype(np.int32)
+        alt_np = idx_other_max.detach().cpu().numpy().astype(np.int32)
+        alt_np = np.where(changed_np == 1, alt_np, -1)
 
-        # libera tudo desse batch
-        del (batch_z, pil_imgs, inputs,
-             outputs, logits, probs, logit_orig, logits_others,
-             logit_other_max, idx_other_max, p_orig, p_other_max,
-             flat, z0_batch, diff, dist_raw, dist_norm,
-             over_radius, pred_classes, changed_mask, same_mask,
-             fitness_before, fitness_after, batch_fitness)
+        metrics["fitness_total"][start:end] = batch_fitness.detach().cpu().numpy()
+        metrics["margin_logit"][start:end] = margin.detach().cpu().numpy()
+        metrics["dist_norm"][start:end] = dist_norm.detach().cpu().numpy()
+        metrics["dist_l2"][start:end] = dist_l2.detach().cpu().numpy()
+        metrics["prob_original_class"][start:end] = p_orig.detach().cpu().numpy()
+        metrics["prob_best_alt_class"][start:end] = p_other_max.detach().cpu().numpy()
+        metrics["pred_class"][start:end] = pred_np
+        metrics["target_class_if_changed"][start:end] = alt_np
+        metrics["logit_original"][start:end] = logit_orig.detach().cpu().numpy()
+        metrics["logit_best_alt"][start:end] = logit_other_max.detach().cpu().numpy()
+        metrics["fitness_margin_term"][start:end] = margin_term.detach().cpu().numpy()
+        metrics["fitness_distance_penalty"][start:end] = distance_penalty.detach().cpu().numpy()
+        metrics["fitness_constraint_penalty"][start:end] = constraint_penalty.detach().cpu().numpy()
+        metrics["constraint_violation"][start:end] = over_radius.detach().cpu().numpy()
+        metrics["within_confidence_region"][start:end] = (over_radius.detach().cpu().numpy() <= 0).astype(np.int32)
+        metrics["changed_class"][start:end] = changed_np
+
+        del (
+            batch_z,
+            pil_imgs,
+            inputs,
+            outputs,
+            logits,
+            probs,
+            logit_orig,
+            logits_others,
+            logit_other_max,
+            idx_other_max,
+            margin,
+            p_orig,
+            p_other_max,
+            flat,
+            z0_batch,
+            diff,
+            dist_l2,
+            dist_norm,
+            over_radius,
+            pred_classes,
+            changed_mask,
+            same_mask,
+            margin_term_before,
+            margin_term_after,
+            margin_term,
+            distance_penalty_before,
+            distance_penalty_after,
+            distance_penalty,
+            constraint_penalty,
+            batch_fitness,
+        )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    return (fitness,
-            margin_all,
-            dist_norm_all,
-            dist_raw_all,
-            p_orig_all,
-            p_other_max_all,
-            pred_class_all)
+    return metrics
+
 
 # ===========================
-# 5. Loop Principal + Salvamento
+# 6. Instrumentação e métricas
 # ===========================
 
-def run_experiments():
+def sanitize_for_path(raw: str) -> str:
+    keep = []
+    for ch in raw:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        else:
+            keep.append("_")
+    return "".join(keep)
+
+
+def tensor_fingerprint(z: torch.Tensor) -> str:
+    z_bytes = z.detach().cpu().numpy().astype(np.float32).tobytes()
+    return hashlib.sha1(z_bytes).hexdigest()[:16]
+
+
+def compact_z_payload(z: torch.Tensor) -> tuple[float, float, float, str]:
+    z_cpu = z.detach().cpu().view(-1)
+    z_mean = float(z_cpu.mean().item())
+    z_std = float(z_cpu.std(unbiased=False).item())
+    z_norm = float(torch.norm(z_cpu, p=2).item())
+    head = z_cpu[:Z_VECTOR_HEAD_SIZE].tolist()
+    return z_mean, z_std, z_norm, json.dumps(head)
+
+
+def maybe_full_z_payload(z: torch.Tensor) -> Optional[str]:
+    if not SAVE_FULL_Z_VECTORS:
+        return None
+    return json.dumps(z.detach().cpu().view(-1).tolist())
+
+
+def compute_population_diversity(population: list[Individual]) -> tuple[float, float]:
+    if not population:
+        return float("nan"), float("nan")
+    z_stack = torch.stack([ind.z.detach().cpu().view(-1) for ind in population], dim=0)
+    centroid = z_stack.mean(dim=0, keepdim=True)
+    dist_to_centroid = torch.norm(z_stack - centroid, dim=1)
+    centroid_mean = float(dist_to_centroid.mean().item())
+
+    n = z_stack.shape[0]
+    if n < 2:
+        return float("nan"), centroid_mean
+
+    with torch.no_grad():
+        # O(n^2) mas viável para população atual (~100)
+        dmat = torch.cdist(z_stack, z_stack, p=2)
+        tri = torch.triu_indices(n, n, offset=1)
+        pairwise = dmat[tri[0], tri[1]]
+        pairwise_mean = float(pairwise.mean().item())
+
+    return pairwise_mean, centroid_mean
+
+
+def write_records_to_parquet_or_csv(records: list[dict[str, Any]], parquet_path: Path) -> tuple[Path, str]:
+    """Prefere parquet; fallback para CSV quando engine não disponível."""
+    if pd is not None:
+        try:
+            df = pd.DataFrame(records)
+            df.to_parquet(parquet_path, index=False)
+            return parquet_path, "parquet"
+        except Exception:
+            pass
+
+    csv_fallback = parquet_path.with_suffix(".csv")
+    if records:
+        keys = list(records[0].keys())
+        with csv_fallback.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for row in records:
+                writer.writerow(row)
+    else:
+        with csv_fallback.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([])
+    return csv_fallback, "csv_fallback"
+
+
+def save_generation_summary(generation_summary_rows: list[dict[str, Any]], output_path: Path) -> None:
+    if not generation_summary_rows:
+        return
+    keys = list(generation_summary_rows[0].keys())
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in generation_summary_rows:
+            writer.writerow(row)
+
+
+def save_run_summary(run_summary: dict[str, Any], output_path: Path) -> None:
+    keys = list(run_summary.keys())
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerow(run_summary)
+
+
+def save_instance_summary(instance_summary: dict[str, Any], output_path: Path) -> None:
+    keys = list(instance_summary.keys())
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerow(instance_summary)
+
+
+def aggregate_generation_metrics(
+    instance_id: str,
+    run_id: str,
+    generation: int,
+    eval_metrics: dict[str, np.ndarray],
+    population: list[Individual],
+    mutation_sigma_reference: float,
+    num_mutation_offspring: int,
+    num_crossover_offspring: int,
+    elite_count: int,
+) -> dict[str, Any]:
+    fitness = eval_metrics["fitness_total"]
+    margins = eval_metrics["margin_logit"]
+    changed = eval_metrics["changed_class"]
+    dist_norm = eval_metrics["dist_norm"]
+
+    flips_mask = changed == 1
+    flip_dists = dist_norm[flips_mask]
+
+    pairwise_mean, centroid_mean = compute_population_diversity(population)
+
+    return {
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "generation": generation,
+        "population_size": int(len(population)),
+        "best_fitness": float(np.max(fitness)),
+        "mean_fitness": float(np.mean(fitness)),
+        "median_fitness": float(np.median(fitness)),
+        "std_fitness": float(np.std(fitness)),
+        "best_margin": float(np.max(margins)),
+        "mean_margin": float(np.mean(margins)),
+        "fraction_margin_positive": float(np.mean(margins > 0)),
+        "num_flips": int(np.sum(flips_mask)),
+        "flip_rate": float(np.mean(flips_mask)),
+        "best_flip_distance": float(np.min(flip_dists)) if flip_dists.size > 0 else float("nan"),
+        "mean_flip_distance": float(np.mean(flip_dists)) if flip_dists.size > 0 else float("nan"),
+        "mean_dist_norm": float(np.mean(dist_norm)),
+        "median_dist_norm": float(np.median(dist_norm)),
+        "std_dist_norm": float(np.std(dist_norm)),
+        "fraction_outside_region": float(np.mean(eval_metrics["within_confidence_region"] == 0)),
+        "mean_pairwise_latent_distance": pairwise_mean,
+        "distance_to_centroid_mean": centroid_mean,
+        "mutation_sigma": float(mutation_sigma_reference),
+        "num_mutation_offspring": int(num_mutation_offspring),
+        "num_crossover_offspring": int(num_crossover_offspring),
+        "elite_count": int(elite_count),
+    }
+
+
+def compute_stagnation_length(best_fitness_per_gen: list[float]) -> int:
+    if not best_fitness_per_gen:
+        return 0
+    best_so_far = -float("inf")
+    last_improvement_idx = 0
+    for idx, val in enumerate(best_fitness_per_gen):
+        if val > best_so_far:
+            best_so_far = val
+            last_improvement_idx = idx
+    return len(best_fitness_per_gen) - 1 - last_improvement_idx
+
+
+def finalize_run_summary(
+    instance_id: str,
+    run_id: str,
+    individual_rows: list[dict[str, Any]],
+    generation_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    total_evals = len(individual_rows)
+    total_generations = len(generation_rows)
+
+    found_flip = any(int(r["changed_class"]) == 1 for r in individual_rows)
+
+    first_flip_row = None
+    if found_flip:
+        for r in individual_rows:
+            if int(r["changed_class"]) == 1:
+                first_flip_row = r
+                break
+
+    num_total_flips = sum(int(r["changed_class"]) == 1 for r in individual_rows)
+    unique_target_classes = {
+        int(r["target_class_if_changed"])
+        for r in individual_rows
+        if int(r["changed_class"]) == 1 and int(r["target_class_if_changed"]) >= 0
+    }
+
+    best_fitness_row = max(individual_rows, key=lambda r: float(r["fitness_total"])) if individual_rows else None
+    best_margin_row = max(individual_rows, key=lambda r: float(r["margin_logit"])) if individual_rows else None
+
+    flip_rows = [r for r in individual_rows if int(r["changed_class"]) == 1]
+
+    best_flip_row = None
+    if flip_rows:
+        best_flip_row = max(flip_rows, key=lambda r: float(r["fitness_total"]))
+
+    max_margin_flip_row = None
+    if flip_rows:
+        max_margin_flip_row = max(flip_rows, key=lambda r: float(r["margin_logit"]))
+
+    diversity_start = float("nan")
+    diversity_mid = float("nan")
+    diversity_end = float("nan")
+    if generation_rows:
+        diversity_start = float(generation_rows[0]["mean_pairwise_latent_distance"])
+        diversity_mid = float(generation_rows[len(generation_rows) // 2]["mean_pairwise_latent_distance"])
+        diversity_end = float(generation_rows[-1]["mean_pairwise_latent_distance"])
+
+    best_fitness_per_gen = [float(r["best_fitness"]) for r in generation_rows]
+    stagnation_length = compute_stagnation_length(best_fitness_per_gen)
+
+    improvement_last_10pct = float("nan")
+    if generation_rows:
+        split_idx = max(1, int(math.floor(0.9 * len(generation_rows))))
+        first_slice = best_fitness_per_gen[:split_idx]
+        last_slice = best_fitness_per_gen[split_idx:]
+        if first_slice and last_slice:
+            improvement_last_10pct = float(max(last_slice) - max(first_slice))
+
+    summary = {
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "total_evals": int(total_evals),
+        "total_generations": int(total_generations),
+        "found_flip": int(bool(found_flip)),
+        "first_flip_eval": int(first_flip_row["eval_id"]) if first_flip_row else None,
+        "first_flip_generation": int(first_flip_row["generation"]) if first_flip_row else None,
+        "evals_to_first_flip": int(first_flip_row["eval_id"]) if first_flip_row else None,
+        "num_total_flips": int(num_total_flips),
+        "num_unique_target_classes": int(len(unique_target_classes)),
+        "best_fitness_ever": float(best_fitness_row["fitness_total"]) if best_fitness_row else float("nan"),
+        "best_margin_ever": float(best_margin_row["margin_logit"]) if best_margin_row else float("nan"),
+        "generation_of_best_fitness": int(best_fitness_row["generation"]) if best_fitness_row else None,
+        "generation_of_best_margin": int(best_margin_row["generation"]) if best_margin_row else None,
+        "best_flip_distance": float(best_flip_row["dist_norm"]) if best_flip_row else float("nan"),
+        "best_flip_margin": float(best_flip_row["margin_logit"]) if best_flip_row else float("nan"),
+        "best_flip_eval": int(best_flip_row["eval_id"]) if best_flip_row else None,
+        "best_flip_generation": int(best_flip_row["generation"]) if best_flip_row else None,
+        "best_flip_lpips": float(best_flip_row["lpips"]) if best_flip_row else float("nan"),
+        "first_flip_distance": float(first_flip_row["dist_norm"]) if first_flip_row else float("nan"),
+        "first_flip_margin": float(first_flip_row["margin_logit"]) if first_flip_row else float("nan"),
+        "max_margin_flip_distance": float(max_margin_flip_row["dist_norm"]) if max_margin_flip_row else float("nan"),
+        "diversity_start": diversity_start,
+        "diversity_mid": diversity_mid,
+        "diversity_end": diversity_end,
+        "stagnation_length": int(stagnation_length),
+        "fitness_improvement_last_10pct_budget": improvement_last_10pct,
+    }
+    return summary
+
+
+def append_individual_rows(
+    rows: list[dict[str, Any]],
+    instance_id: str,
+    run_id: str,
+    generation: int,
+    population: list[Individual],
+    eval_metrics: dict[str, np.ndarray],
+    eval_counter: dict[str, int],
+    eval_stage: str = "in_loop",
+    recon_prefix: Optional[str] = None,
+) -> None:
+    for idx, ind in enumerate(population):
+        eval_counter["value"] += 1
+        eval_id = eval_counter["value"]
+
+        z_mean, z_std, z_norm, z_head_json = compact_z_payload(ind.z)
+        z_full = maybe_full_z_payload(ind.z)
+
+        row = {
+            "instance_id": instance_id,
+            "run_id": run_id,
+            "generation": int(generation),
+            "eval_stage": eval_stage,
+            "eval_id": int(eval_id),
+            "individual_id": int(ind.individual_id),
+            "parent_ids": ind.parent_ids,
+            "created_by": ind.created_by,
+            "pred_class": int(eval_metrics["pred_class"][idx]),
+            "changed_class": int(eval_metrics["changed_class"][idx]),
+            "target_class_if_changed": int(eval_metrics["target_class_if_changed"][idx]),
+            "prob_original_class": float(eval_metrics["prob_original_class"][idx]),
+            "prob_best_alt_class": float(eval_metrics["prob_best_alt_class"][idx]),
+            "logit_original": float(eval_metrics["logit_original"][idx]),
+            "logit_best_alt": float(eval_metrics["logit_best_alt"][idx]),
+            "margin_logit": float(eval_metrics["margin_logit"][idx]),
+            "fitness_total": float(eval_metrics["fitness_total"][idx]),
+            "fitness_margin_term": float(eval_metrics["fitness_margin_term"][idx]),
+            "fitness_distance_penalty": float(eval_metrics["fitness_distance_penalty"][idx]),
+            "fitness_constraint_penalty": float(eval_metrics["fitness_constraint_penalty"][idx]),
+            "dist_l2": float(eval_metrics["dist_l2"][idx]),
+            "dist_norm": float(eval_metrics["dist_norm"][idx]),
+            "within_confidence_region": int(eval_metrics["within_confidence_region"][idx]),
+            "constraint_violation": float(eval_metrics["constraint_violation"][idx]),
+            "lpips": float("nan"),  # reservado para cálculo opcional futuro
+            "z_hash": tensor_fingerprint(ind.z),
+            "z_mean": z_mean,
+            "z_std": z_std,
+            "z_l2_norm": z_norm,
+            "z_head": z_head_json,
+            "z_vector": z_full,
+            "mutation_sigma": float(ind.mutation_sigma) if ind.mutation_sigma is not None else float("nan"),
+            "birth_generation": int(ind.birth_generation),
+            "reconstruction_ref": None,
+        }
+        rows.append(row)
+
+
+def export_legacy_metrics_csv(individual_rows: list[dict[str, Any]], out_path: Path) -> None:
+    """Compatibilidade com saída antiga metrics_per_gen.csv."""
+    keys = [
+        "generation",
+        "index",
+        "fitness",
+        "margin_logit",
+        "dist_norm",
+        "dist_raw",
+        "p_orig",
+        "p_other_max",
+        "pred_class",
+        "changed_class",
+    ]
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for r in individual_rows:
+            if r.get("eval_stage") != "in_loop":
+                continue
+            grouped.setdefault(int(r["generation"]), []).append(r)
+
+        for generation in sorted(grouped.keys()):
+            rows = grouped[generation]
+            for idx, row in enumerate(rows):
+                writer.writerow({
+                    "generation": generation,
+                    "index": idx,
+                    "fitness": row["fitness_total"],
+                    "margin_logit": row["margin_logit"],
+                    "dist_norm": row["dist_norm"],
+                    "dist_raw": row["dist_l2"],
+                    "p_orig": row["prob_original_class"],
+                    "p_other_max": row["prob_best_alt_class"],
+                    "pred_class": row["pred_class"],
+                    "changed_class": row["changed_class"],
+                })
+
+
+def load_metrics_artifacts(run_dir: str) -> dict[str, Any]:
+    """
+    Carrega artefatos novos/antigos quando disponíveis.
+    Preferência: individual_log.parquet -> individual_log.csv -> metrics_per_gen.csv.
+    """
+    base = Path(run_dir)
+    out: dict[str, Any] = {"individual": None, "generation": None, "run": None, "legacy": None}
+
+    individual_parquet = base / "individual_log.parquet"
+    individual_csv = base / "individual_log.csv"
+    generation_csv = base / "generation_summary.csv"
+    run_csv = base / "run_summary.csv"
+    legacy_csv = base / "metrics_per_gen.csv"
+
+    if pd is not None:
+        if individual_parquet.exists():
+            try:
+                out["individual"] = pd.read_parquet(individual_parquet)
+            except Exception:
+                out["individual"] = None
+        elif individual_csv.exists():
+            out["individual"] = pd.read_csv(individual_csv)
+
+        if generation_csv.exists():
+            out["generation"] = pd.read_csv(generation_csv)
+        if run_csv.exists():
+            out["run"] = pd.read_csv(run_csv)
+        if legacy_csv.exists():
+            out["legacy"] = pd.read_csv(legacy_csv)
+    else:
+        out["individual"] = str(individual_parquet if individual_parquet.exists() else individual_csv)
+        out["generation"] = str(generation_csv) if generation_csv.exists() else None
+        out["run"] = str(run_csv) if run_csv.exists() else None
+        out["legacy"] = str(legacy_csv) if legacy_csv.exists() else None
+
+    return out
+
+
+def derive_from_legacy_metrics(legacy_metrics_csv: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Deriva o máximo possível a partir de logs antigos (sem classificador/decoder).
+    Métricas indisponíveis permanecem NaN/None.
+    """
+    rows: list[dict[str, Any]] = []
+    with open(legacy_metrics_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for r in rows:
+        g = int(r["generation"])
+        grouped.setdefault(g, []).append(r)
+
+    generation_summary: list[dict[str, Any]] = []
+    for g in sorted(grouped.keys()):
+        rr = grouped[g]
+        fitness = np.array([float(x["fitness"]) for x in rr], dtype=np.float32)
+        margins = np.array([float(x["margin_logit"]) for x in rr], dtype=np.float32)
+        dist_norm = np.array([float(x["dist_norm"]) for x in rr], dtype=np.float32)
+        flips = np.array([int(x["changed_class"]) for x in rr], dtype=np.int32)
+
+        generation_summary.append({
+            "generation": g,
+            "population_size": int(len(rr)),
+            "best_fitness": float(np.max(fitness)),
+            "mean_fitness": float(np.mean(fitness)),
+            "median_fitness": float(np.median(fitness)),
+            "std_fitness": float(np.std(fitness)),
+            "best_margin": float(np.max(margins)),
+            "mean_margin": float(np.mean(margins)),
+            "flip_rate": float(np.mean(flips == 1)),
+            "num_flips": int(np.sum(flips == 1)),
+            "mean_dist_norm": float(np.mean(dist_norm)),
+            "fraction_outside_region": float("nan"),
+            "mean_pairwise_latent_distance": float("nan"),
+            "distance_to_centroid_mean": float("nan"),
+        })
+
+    run_summary = {
+        "total_evals": int(len(rows)),
+        "total_generations": int(len(grouped)),
+        "found_flip": int(any(int(r["changed_class"]) == 1 for r in rows)),
+        "num_total_flips": int(sum(int(r["changed_class"]) == 1 for r in rows)),
+        "best_fitness_ever": float(max(float(r["fitness"]) for r in rows)) if rows else float("nan"),
+        "best_margin_ever": float(max(float(r["margin_logit"]) for r in rows)) if rows else float("nan"),
+        "note": "Resumo derivado de logs legados; métricas de logits detalhados, parent_ids, diversidade latente e run-level avançado não podem ser reconstruídas sem rerun.",
+    }
+
+    return generation_summary, run_summary
+
+
+# ===========================
+# 7. Loop Principal + Salvamento
+# ===========================
+
+def run_experiments() -> None:
     if not os.path.exists(INPUT_IMAGE_PATH):
         raise FileNotFoundError(f"Imagem de entrada não encontrada em {INPUT_IMAGE_PATH}")
     x0_pil = Image.open(INPUT_IMAGE_PATH).convert("RGB")
 
     z0 = encode_image_to_latent(x0_pil)
     latent_shape, latent_dim, latent_dim_sqrt = get_latent_stats(z0)
-    logits0, p0, pred_class = get_classifier_logits_and_class(x0_pil)
+    _, p0, pred_class = get_classifier_logits_and_class(x0_pil)
 
     if TARGET_CLASS < 0:
         target_class = pred_class
@@ -321,18 +865,28 @@ def run_experiments():
         target_class = TARGET_CLASS
 
     print(f"Imagem de entrada: {INPUT_IMAGE_PATH}")
-    print(f"Classe predita: {CIFAR10_CLASSES[pred_class]} (índice {pred_class}), p0 = {p0:.4f}")
-    print(f"Classe original usada em LEI-Local: {CIFAR10_CLASSES[target_class]} (índice {target_class})")
+    print(f"Classe predita: {CIFAR10_CLASSES[pred_class]} (indice {pred_class}), p0 = {p0:.4f}")
+    print(f"Classe original usada em LEI-Local: {CIFAR10_CLASSES[target_class]} (indice {target_class})")
 
     timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
-    run_dir = os.path.join(OUTPUT_BASE, timestamp)
-    os.makedirs(OUTPUT_BASE, exist_ok=True)
-    os.makedirs(run_dir, exist_ok=True)
+    instance_id = sanitize_for_path(Path(INPUT_IMAGE_PATH).stem)
+    confidence_group = f"trr_{TRUST_REGION_RADIUS:.2f}"
+    run_id = timestamp
+
+    run_dir = (
+        Path(OUTPUT_BASE)
+        / f"instance={instance_id}"
+        / f"class={target_class}"
+        / f"confidence={confidence_group}"
+        / f"seed={seed}"
+        / f"run={run_id}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("evolution")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    fh = logging.FileHandler(os.path.join(run_dir, "run.log"))
+    fh = logging.FileHandler(run_dir / "run.log")
     formatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -365,81 +919,67 @@ def run_experiments():
         "DIST_GAMMA_AFTER": DIST_GAMMA_AFTER,
         "MARGIN_GAMMA_AFTER": MARGIN_GAMMA_AFTER,
         "INPUT_IMAGE_PATH": INPUT_IMAGE_PATH,
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "confidence_group": confidence_group,
     }
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
+    with (run_dir / "config.json").open("w") as f:
         json.dump(config, f, indent=2)
-
-    metrics_path = os.path.join(run_dir, "metrics_per_gen.csv")
-    with open(metrics_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "generation",
-            "index",
-            "fitness",
-            "margin_logit",
-            "dist_norm",
-            "dist_raw",
-            "p_orig",
-            "p_other_max",
-            "pred_class",
-            "changed_class"
-        ])
 
     gens_lin = list(np.linspace(1, NUM_GERACOES, N_SNAPSHOTS, dtype=int))
     snapshot_gens = sorted(set(gens_lin + [NUM_GERACOES]))
 
-    pop_z = init_population_local(z0, POPULACAO_INICIAL)
+    id_counter = {"value": 0}
+    eval_counter = {"value": 0}
 
-    grid_frames = []
+    population = init_population_local(z0, POPULACAO_INICIAL, id_counter)
 
-    pbar = tqdm(range(1, NUM_GERACOES + 1), desc="Gerações")
+    grid_frames: list[Image.Image] = []
+    individual_rows: list[dict[str, Any]] = []
+    generation_rows: list[dict[str, Any]] = []
+
+    pbar = tqdm(range(1, NUM_GERACOES + 1), desc="Geracoes")
+
+    last_eval_metrics: Optional[dict[str, np.ndarray]] = None
+    last_generation_evald = None
+
     for gen in pbar:
-        (fitness,
-         margin_arr,
-         dist_norm_arr,
-         dist_raw_arr,
-         p_orig_arr,
-         p_other_arr,
-         pred_class_arr) = evaluate_fitness_sensitivity(
-            pop_z, z0, logits0, target_class, latent_dim_sqrt
+        eval_metrics = evaluate_fitness_sensitivity(
+            population, z0, target_class, latent_dim_sqrt
         )
+        fitness = eval_metrics["fitness_total"]
 
-        mean_f = float(fitness.mean())
-        best_f = float(fitness.max())
-        std_f = float(fitness.std())
-        frac_changed = float((pred_class_arr != target_class).mean())
+        mean_f = float(np.mean(fitness))
+        best_f = float(np.max(fitness))
+        std_f = float(np.std(fitness))
+        frac_changed = float(np.mean(eval_metrics["changed_class"] == 1))
 
         logger.info(
-            f"Geração {gen:03d} — mean={mean_f:.4f}, best={best_f:.4f}, "
+            f"Geracao {gen:03d} - mean={mean_f:.4f}, best={best_f:.4f}, "
             f"std={std_f:.4f}, frac_changed={frac_changed:.3f}"
         )
 
-        with open(metrics_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            for idx in range(len(pop_z)):
-                changed = int(pred_class_arr[idx] != target_class)
-                writer.writerow([
-                    gen,
-                    idx,
-                    float(fitness[idx]),
-                    float(margin_arr[idx]),
-                    float(dist_norm_arr[idx]),
-                    float(dist_raw_arr[idx]),
-                    float(p_orig_arr[idx]),
-                    float(p_other_arr[idx]),
-                    int(pred_class_arr[idx]),
-                    changed,
-                ])
+        append_individual_rows(
+            rows=individual_rows,
+            instance_id=instance_id,
+            run_id=run_id,
+            generation=gen,
+            population=population,
+            eval_metrics=eval_metrics,
+            eval_counter=eval_counter,
+            eval_stage="in_loop",
+            recon_prefix="best_gen" if SAVE_RECONSTRUCTION_PATH_IN_LOG else None,
+        )
 
         if gen % 5 == 0:
             best_idx_5 = int(np.argmax(fitness))
-            best_tensor_5 = pop_z[best_idx_5]
+            best_tensor_5 = population[best_idx_5].z
             with torch.no_grad():
                 recon_5 = vae.decode(best_tensor_5.unsqueeze(0) / VAE_SCALING_FACTOR).sample
             recon_5 = (recon_5.clamp(-1, 1) + 1.0) / 2.0
             recon_cpu_5 = recon_5.cpu().squeeze(0)
             pil_best_5 = transforms.ToPILImage()(recon_cpu_5).resize((224, 224))
-            pil_best_5.save(os.path.join(run_dir, f"best_gen_{gen}.png"))
+            pil_best_5.save(run_dir / f"best_gen_{gen}.png")
             del recon_5, recon_cpu_5, pil_best_5
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -449,7 +989,7 @@ def run_experiments():
             indices = np.linspace(0, len(sorted_idxs) - 1, K_GRID, dtype=int)
             W, H = 224, 224
             grid_img = Image.new("RGB", (n_cols * W, n_rows * H))
-            selected = [pop_z[idx] for idx in sorted_idxs[indices]]
+            selected = [population[idx].z for idx in sorted_idxs[indices]]
             batch_z = torch.stack(selected, dim=0).to(DEVICE)
             pil_imgs = latent_batch_to_pil(batch_z)
             for j, pil in enumerate(pil_imgs):
@@ -462,56 +1002,197 @@ def run_experiments():
                 torch.cuda.empty_cache()
 
         elite_idxs = np.argsort(fitness)[-ELITISM:][::-1]
-        new_pop = [pop_z[i] for i in elite_idxs]
+        new_pop: list[Individual] = []
+
+        for ei in elite_idxs:
+            p = population[int(ei)]
+            new_pop.append(
+                Individual(
+                    individual_id=next_individual_id(id_counter),
+                    z=p.z.clone(),
+                    created_by="elite",
+                    parent_ids=str(p.individual_id),
+                    mutation_sigma=None,
+                    birth_generation=gen,
+                )
+            )
+
+        num_mutation_offspring = 0
+        num_crossover_offspring = 0
+        mutation_sigmas_this_gen: list[float] = []
 
         while len(new_pop) < POPULACAO_INICIAL:
-            p1 = tournament_selection(pop_z, fitness)
-            p2 = tournament_selection(pop_z, fitness)
-            child = crossover_latent(p1, p2) if random.random() < PROB_CROSSOVER else p1.clone()
-            if random.random() < PROB_MUTACAO:
-                child = mutate_latent(child, gen)
-            new_pop.append(child)
+            p1_idx = tournament_selection_index(len(population), fitness)
+            p2_idx = tournament_selection_index(len(population), fitness)
 
-        pop_z = new_pop
-        pbar.set_postfix(mean=f"{mean_f:.3f}", best=f"{best_f:.3f}",
-                         frac_changed=f"{frac_changed:.2f}")
+            p1 = population[p1_idx]
+            p2 = population[p2_idx]
+
+            if random.random() < PROB_CROSSOVER:
+                child_z = crossover_latent(p1.z, p2.z)
+                created_by = "crossover"
+                parent_ids = f"{p1.individual_id}|{p2.individual_id}"
+                num_crossover_offspring += 1
+            else:
+                child_z = p1.z.clone()
+                created_by = "clone"
+                parent_ids = str(p1.individual_id)
+
+            mutation_sigma: Optional[float] = None
+            if random.random() < PROB_MUTACAO:
+                mutation_sigma = get_mutation_sigma(gen)
+                child_z = mutate_latent(child_z, mutation_sigma)
+                if created_by == "crossover":
+                    created_by = "crossover+mutation"
+                else:
+                    created_by = "mutation"
+                num_mutation_offspring += 1
+                mutation_sigmas_this_gen.append(float(mutation_sigma))
+
+            new_pop.append(
+                Individual(
+                    individual_id=next_individual_id(id_counter),
+                    z=child_z,
+                    created_by=created_by,
+                    parent_ids=parent_ids,
+                    mutation_sigma=mutation_sigma,
+                    birth_generation=gen,
+                )
+            )
+
+        sigma_ref = float(np.mean(mutation_sigmas_this_gen)) if mutation_sigmas_this_gen else 0.0
+        generation_rows.append(
+            aggregate_generation_metrics(
+                instance_id=instance_id,
+                run_id=run_id,
+                generation=gen,
+                eval_metrics=eval_metrics,
+                population=population,
+                mutation_sigma_reference=sigma_ref,
+                num_mutation_offspring=num_mutation_offspring,
+                num_crossover_offspring=num_crossover_offspring,
+                elite_count=ELITISM,
+            )
+        )
+
+        population = new_pop
+        pbar.set_postfix(mean=f"{mean_f:.3f}", best=f"{best_f:.3f}", frac_changed=f"{frac_changed:.2f}")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    torch.save(pop_z, os.path.join(run_dir, "final_population.pt"))
+        last_eval_metrics = eval_metrics
+        last_generation_evald = gen
 
-    (final_fitness,
-     final_margin,
-     final_dist_norm,
-     final_dist_raw,
-     final_p_orig,
-     final_p_other,
-     final_pred_class) = evaluate_fitness_sensitivity(
-        pop_z, z0, logits0, target_class, latent_dim_sqrt
+    torch.save(population, run_dir / "final_population.pt")
+
+    # Mantém compatibilidade com fluxo atual: avalia população final ainda não avaliada no loop.
+    final_metrics = evaluate_fitness_sensitivity(
+        population, z0, target_class, latent_dim_sqrt
     )
-    best_idx_final = int(np.argmax(final_fitness))
-    best_tensor_final = pop_z[best_idx_final]
+    append_individual_rows(
+        rows=individual_rows,
+        instance_id=instance_id,
+        run_id=run_id,
+        generation=NUM_GERACOES,
+        population=population,
+        eval_metrics=final_metrics,
+        eval_counter=eval_counter,
+        eval_stage="final_eval",
+        recon_prefix="best_final_eval" if SAVE_RECONSTRUCTION_PATH_IN_LOG else None,
+    )
+
+    best_idx_final = int(np.argmax(final_metrics["fitness_total"]))
+    best_tensor_final = population[best_idx_final].z
 
     with torch.no_grad():
         recon_final = vae.decode(best_tensor_final.unsqueeze(0) / VAE_SCALING_FACTOR).sample
     recon_final = (recon_final.clamp(-1, 1) + 1.0) / 2.0
     recon_cpu_final = recon_final.cpu().squeeze(0)
     pil_best_final = transforms.ToPILImage()(recon_cpu_final).resize((224, 224))
-    pil_best_final.save(os.path.join(run_dir, "best_final.png"))
+    pil_best_final.save(run_dir / "best_final.png")
 
     delta_z_best = (best_tensor_final - z0.to(best_tensor_final.device)).detach().cpu().numpy()
-    np.save(os.path.join(run_dir, "best_delta_z.npy"), delta_z_best)
+    np.save(run_dir / "best_delta_z.npy", delta_z_best)
 
     if grid_frames:
         grid_frames[0].save(
-            os.path.join(run_dir, "gif_evolution.gif"),
+            run_dir / "gif_evolution.gif",
             save_all=True,
             append_images=grid_frames[1:],
             duration=500,
-            loop=0
+            loop=0,
         )
 
+    individual_log_path, individual_format = write_records_to_parquet_or_csv(
+        individual_rows,
+        run_dir / "individual_log.parquet",
+    )
+    save_generation_summary(generation_rows, run_dir / "generation_summary.csv")
+
+    run_summary = finalize_run_summary(
+        instance_id=instance_id,
+        run_id=run_id,
+        individual_rows=individual_rows,
+        generation_rows=generation_rows,
+    )
+    save_run_summary(run_summary, run_dir / "run_summary.csv")
+
+    instance_summary = {
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "seed": seed,
+        "orig_class": target_class,
+        "orig_class_name": CIFAR10_CLASSES[target_class],
+        "input_image_path": INPUT_IMAGE_PATH,
+        "individual_log_path": str(individual_log_path),
+        "individual_log_format": individual_format,
+        "generation_summary_path": str(run_dir / "generation_summary.csv"),
+        "run_summary_path": str(run_dir / "run_summary.csv"),
+    }
+    save_instance_summary(instance_summary, run_dir / "instance_summary.csv")
+
+    # Mantém saída antiga para retrocompatibilidade
+    export_legacy_metrics_csv(individual_rows, run_dir / "metrics_per_gen.csv")
+
+    artifacts_doc = {
+        "where": str(run_dir),
+        "files": {
+            "individual_log": str(individual_log_path),
+            "generation_summary": str(run_dir / "generation_summary.csv"),
+            "run_summary": str(run_dir / "run_summary.csv"),
+            "instance_summary": str(run_dir / "instance_summary.csv"),
+            "legacy_metrics": str(run_dir / "metrics_per_gen.csv"),
+        },
+        "notes": [
+            "individual_log tem uma linha por individuo avaliado (inclui geração final de avaliação).",
+            "generation_summary agrega métricas por geração.",
+            "run_summary agrega métricas finais por run.",
+            "lpips é reservado (NaN) até ser integrado ao pipeline.",
+            "z_vector completo é opcional (SAVE_FULL_Z_VECTORS).",
+        ],
+    }
+    with (run_dir / "artifacts_manifest.json").open("w") as f:
+        json.dump(artifacts_doc, f, indent=2)
+
+
+# ===========================
+# 8. Exemplo rápido / documentação programática
+# ===========================
+
+def print_usage_example() -> None:
+    example = {
+        "run": "python genetico.py",
+        "inspect": [
+            "cat <run_dir>/run_summary.csv",
+            "head -n 5 <run_dir>/generation_summary.csv",
+            "python -c \"import pandas as pd; print(pd.read_parquet('<run_dir>/individual_log.parquet').head())\"",
+        ],
+        "retro_compat": "derive_from_legacy_metrics('<run_dir>/metrics_per_gen.csv')",
+    }
+    print(json.dumps(example, indent=2))
+
+
 if __name__ == "__main__":
-    print("Executando LEI-Local (Sensibilidade: perturbação mínima) →", OUTPUT_BASE)
+    print("Executando LEI-Local (Sensibilidade: perturbacao minima) ->", OUTPUT_BASE)
     run_experiments()
