@@ -76,14 +76,15 @@ CIFAR10_CLASSES = {
 print(f"Usando dispositivo: {DEVICE}")
 
 # ===========================
-# 1. Hiperparâmetros do GA
+# 1. Hiperparâmetros (CMA-ES)
 # ===========================
 NUM_GERACOES = 200
-POPULACAO_INICIAL = 100
+POPULACAO_INICIAL = 100  # lambda (tamanho da população por geração)
 
-ELITISM = 1
-PROB_MUTACAO = 0.95
-PROB_CROSSOVER = 0.05
+# Sigmas para CMA-ES (análogo à escala de exploração do GA)
+SIGMA_LOCAL = 0.20
+SIGMA_MIN = 1e-6
+SIGMA_MAX = 3.0
 
 PIXEL_PERTURB_STD = 0.30
 
@@ -94,7 +95,7 @@ n_cols = int(np.ceil(np.sqrt(K_GRID)))
 n_rows = int(np.ceil(K_GRID / n_cols))
 
 N_SNAPSHOTS = 25
-OUTPUT_BASE = "outputs_lei_local_sensitivity"
+OUTPUT_BASE = "outputs_lei_local_sensitivity_cmaes"
 
 SIGMA_INIT = 1.0
 
@@ -126,8 +127,6 @@ MARGIN_GAMMA_AFTER = 0.2
 
 TRUST_REGION_RADIUS = 0.75
 TRUST_REGION_PENALTY = 2.0
-
-SIGMA_LOCAL = 0.20
 
 # ===========================
 # 1.2. Logging / Artefatos
@@ -215,7 +214,7 @@ def get_classifier_logits_and_class(pil_img: Image.Image) -> tuple[torch.Tensor,
 
 
 # ===========================
-# 3. Operadores Genéticos
+# 3. Operadores CMA-ES
 # ===========================
 
 @dataclass
@@ -233,42 +232,165 @@ def next_individual_id(counter: dict[str, int]) -> int:
     return counter["value"]
 
 
-def init_population_local(z0: torch.Tensor, size: int, id_counter: dict[str, int]) -> list[Individual]:
-    pop: list[Individual] = []
-    for _ in range(size):
-        noise = torch.randn_like(z0) * SIGMA_LOCAL
-        pop.append(
+@dataclass
+class CMAESState:
+    mean: np.ndarray
+    sigma: float
+    C: np.ndarray
+    B: np.ndarray
+    D: np.ndarray
+    p_c: np.ndarray
+    p_sigma: np.ndarray
+    weights: np.ndarray
+    mu_eff: float
+    c_sigma: float
+    d_sigma: float
+    c_c: float
+    c1: float
+    c_mu: float
+    chi_n: float
+    dim: int
+    lambda_: int
+    mu: int
+
+
+def flatten_latent(z: torch.Tensor) -> np.ndarray:
+    return z.detach().cpu().view(-1).numpy().astype(np.float32)
+
+
+def vector_to_latent(v: np.ndarray, latent_shape: tuple[int, ...]) -> torch.Tensor:
+    return torch.from_numpy(v.reshape(latent_shape)).to(DEVICE).float()
+
+
+def init_cmaes(z0: torch.Tensor, lambda_: int) -> CMAESState:
+    x0 = flatten_latent(z0)
+    dim = int(x0.size)
+    mu = lambda_ // 2
+    if mu < 1:
+        raise ValueError("CMA-ES requer lambda >= 2 para definir mu >= 1.")
+
+    raw_weights = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
+    weights = raw_weights / np.sum(raw_weights)
+    mu_eff = float((np.sum(weights) ** 2) / np.sum(weights ** 2))
+
+    c_sigma = float((mu_eff + 2.0) / (dim + mu_eff + 5.0))
+    d_sigma = float(1.0 + 2.0 * max(0.0, np.sqrt((mu_eff - 1.0) / (dim + 1.0)) - 1.0) + c_sigma)
+    c_c = float((4.0 + mu_eff / dim) / (dim + 4.0 + 2.0 * mu_eff / dim))
+    c1 = float(2.0 / ((dim + 1.3) ** 2 + mu_eff))
+    c_mu = float(min(1.0 - c1, 2.0 * (mu_eff - 2.0 + 1.0 / mu_eff) / ((dim + 2.0) ** 2 + mu_eff)))
+    chi_n = float(np.sqrt(dim) * (1.0 - 1.0 / (4.0 * dim) + 1.0 / (21.0 * dim * dim)))
+
+    C = np.eye(dim, dtype=np.float64)
+    B = np.eye(dim, dtype=np.float64)
+    D = np.ones(dim, dtype=np.float64)
+    p_c = np.zeros(dim, dtype=np.float64)
+    p_sigma = np.zeros(dim, dtype=np.float64)
+
+    return CMAESState(
+        mean=x0.astype(np.float64),
+        sigma=float(SIGMA_LOCAL),
+        C=C,
+        B=B,
+        D=D,
+        p_c=p_c,
+        p_sigma=p_sigma,
+        weights=weights.astype(np.float64),
+        mu_eff=mu_eff,
+        c_sigma=c_sigma,
+        d_sigma=d_sigma,
+        c_c=c_c,
+        c1=c1,
+        c_mu=c_mu,
+        chi_n=chi_n,
+        dim=dim,
+        lambda_=lambda_,
+        mu=mu,
+    )
+
+
+def sample_population_from_cmaes(
+    state: CMAESState,
+    latent_shape: tuple[int, ...],
+    generation: int,
+    id_counter: dict[str, int],
+) -> tuple[list[Individual], np.ndarray]:
+    z_samples = np.random.randn(state.lambda_, state.dim)
+    y_samples = (z_samples * state.D) @ state.B.T
+    x_samples = state.mean[None, :] + state.sigma * y_samples
+
+    population: list[Individual] = []
+    for i in range(state.lambda_):
+        z_tensor = vector_to_latent(x_samples[i].astype(np.float32), latent_shape)
+        population.append(
             Individual(
                 individual_id=next_individual_id(id_counter),
-                z=(z0 + noise).to(DEVICE),
-                created_by="init",
-                parent_ids="",
-                mutation_sigma=float(SIGMA_LOCAL),
-                birth_generation=0,
+                z=z_tensor,
+                created_by="cmaes_sample",
+                parent_ids="cma_mean",
+                mutation_sigma=float(state.sigma),
+                birth_generation=int(generation),
             )
         )
-    return pop
+    return population, x_samples
 
 
-def get_mutation_sigma(gen: int) -> float:
-    factor = 0.05 + 0.95 * (1.0 - (gen - 1) / (NUM_GERACOES - 1))
-    max_std = PIXEL_PERTURB_STD * factor
-    return torch.rand(1, device=DEVICE).item() * max_std
+def update_cmaes(
+    state: CMAESState,
+    x_samples: np.ndarray,
+    fitness: np.ndarray,
+) -> CMAESState:
+    order = np.argsort(-fitness.astype(np.float64))
+    x_sorted = x_samples[order]
+    x_mu = x_sorted[: state.mu]
 
+    mean_old = state.mean.copy()
+    mean_new = np.sum(x_mu * state.weights[:, None], axis=0)
+    y_w = (mean_new - mean_old) / max(state.sigma, 1e-12)
 
-def mutate_latent(z: torch.Tensor, sigma: float) -> torch.Tensor:
-    noise = torch.randn_like(z) * sigma
-    return z + noise
+    inv_sqrt_c_y = state.B @ ((state.B.T @ y_w) / state.D)
+    state.p_sigma = (1.0 - state.c_sigma) * state.p_sigma + np.sqrt(
+        state.c_sigma * (2.0 - state.c_sigma) * state.mu_eff
+    ) * inv_sqrt_c_y
 
+    norm_p_sigma = float(np.linalg.norm(state.p_sigma))
+    denom = np.sqrt(max(1.0 - (1.0 - state.c_sigma) ** (2.0), 1e-12))
+    h_sigma_cond = norm_p_sigma / (denom * state.chi_n)
+    h_sigma = 1.0 if h_sigma_cond < (1.4 + 2.0 / (state.dim + 1.0)) else 0.0
 
-def crossover_latent(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-    alpha = torch.rand(1, device=DEVICE)
-    return alpha * z1 + (1.0 - alpha) * z2
+    state.p_c = (1.0 - state.c_c) * state.p_c + h_sigma * np.sqrt(
+        state.c_c * (2.0 - state.c_c) * state.mu_eff
+    ) * y_w
 
+    y_k = (x_mu - mean_old[None, :]) / max(state.sigma, 1e-12)
+    rank_mu = np.zeros_like(state.C)
+    for i in range(state.mu):
+        y = y_k[i][:, None]
+        rank_mu += state.weights[i] * (y @ y.T)
 
-def tournament_selection_index(pop_size: int, fitness: np.ndarray, k: int = 2) -> int:
-    idxs = random.sample(range(pop_size), k)
-    return idxs[0] if fitness[idxs[0]] >= fitness[idxs[1]] else idxs[1]
+    delta_h_sigma = (1.0 - h_sigma) * state.c_c * (2.0 - state.c_c)
+    state.C = (
+        (1.0 - state.c1 - state.c_mu) * state.C
+        + state.c1 * ((state.p_c[:, None] @ state.p_c[None, :]) + delta_h_sigma * state.C)
+        + state.c_mu * rank_mu
+    )
+
+    state.C = 0.5 * (state.C + state.C.T)
+
+    eigvals, eigvecs = np.linalg.eigh(state.C)
+    eigvals = np.maximum(eigvals, 1e-20)
+    state.D = np.sqrt(eigvals)
+    state.B = eigvecs
+
+    state.sigma = float(
+        np.clip(
+            state.sigma * np.exp((state.c_sigma / state.d_sigma) * ((norm_p_sigma / state.chi_n) - 1.0)),
+            SIGMA_MIN,
+            SIGMA_MAX,
+        )
+    )
+
+    state.mean = mean_new
+    return state
 
 
 # ===========================
@@ -960,14 +1082,14 @@ def run_single_experiment(
     config = {
         "seed": run_seed,
         "run_sequence_idx": run_sequence_idx,
+        "optimizer": "cmaes",
         "NUM_GERACOES": NUM_GERACOES,
         "POPULACAO_INICIAL": POPULACAO_INICIAL,
-        "ELITISM": ELITISM,
-        "PROB_MUTACAO": PROB_MUTACAO,
-        "PROB_CROSSOVER": PROB_CROSSOVER,
         "PIXEL_PERTURB_STD": PIXEL_PERTURB_STD,
         "SIGMA_INIT": SIGMA_INIT,
         "SIGMA_LOCAL": SIGMA_LOCAL,
+        "SIGMA_MIN": SIGMA_MIN,
+        "SIGMA_MAX": SIGMA_MAX,
         "BATCH_EVAL_SIZE": BATCH_EVAL_SIZE,
         "ORIG_CLASS": target_class,
         "ORIG_CLASS_NAME": class_name(target_class),
@@ -993,8 +1115,6 @@ def run_single_experiment(
         "run_id": run_id,
         "confidence_group": confidence_group,
     }
-    with (run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2)
 
     gens_lin = list(np.linspace(1, NUM_GERACOES, N_SNAPSHOTS, dtype=int))
     snapshot_gens = sorted(set(gens_lin + [NUM_GERACOES]))
@@ -1002,7 +1122,21 @@ def run_single_experiment(
     id_counter = {"value": 0}
     eval_counter = {"value": 0}
 
-    population = init_population_local(z0, POPULACAO_INICIAL, id_counter)
+    cma_state = init_cmaes(z0, POPULACAO_INICIAL)
+    config["CMA_MU"] = cma_state.mu
+    config["CMA_MU_EFF"] = cma_state.mu_eff
+    config["CMA_C_SIGMA"] = cma_state.c_sigma
+    config["CMA_D_SIGMA"] = cma_state.d_sigma
+    config["CMA_C_C"] = cma_state.c_c
+    config["CMA_C1"] = cma_state.c1
+    config["CMA_C_MU"] = cma_state.c_mu
+    config["CMA_CHI_N"] = cma_state.chi_n
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(config, f, indent=2)
+
+    population, x_samples = sample_population_from_cmaes(
+        cma_state, latent_shape, generation=0, id_counter=id_counter
+    )
 
     grid_frames: list[Image.Image] = []
     individual_rows: list[dict[str, Any]] = []
@@ -1068,66 +1202,8 @@ def run_single_experiment(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        elite_idxs = np.argsort(fitness)[-ELITISM:][::-1]
-        new_pop: list[Individual] = []
-
-        for ei in elite_idxs:
-            p = population[int(ei)]
-            new_pop.append(
-                Individual(
-                    individual_id=next_individual_id(id_counter),
-                    z=p.z.clone(),
-                    created_by="elite",
-                    parent_ids=str(p.individual_id),
-                    mutation_sigma=None,
-                    birth_generation=gen,
-                )
-            )
-
-        num_mutation_offspring = 0
-        num_crossover_offspring = 0
-        mutation_sigmas_this_gen: list[float] = []
-
-        while len(new_pop) < POPULACAO_INICIAL:
-            p1_idx = tournament_selection_index(len(population), fitness)
-            p2_idx = tournament_selection_index(len(population), fitness)
-
-            p1 = population[p1_idx]
-            p2 = population[p2_idx]
-
-            if random.random() < PROB_CROSSOVER:
-                child_z = crossover_latent(p1.z, p2.z)
-                created_by = "crossover"
-                parent_ids = f"{p1.individual_id}|{p2.individual_id}"
-                num_crossover_offspring += 1
-            else:
-                child_z = p1.z.clone()
-                created_by = "clone"
-                parent_ids = str(p1.individual_id)
-
-            mutation_sigma: Optional[float] = None
-            if random.random() < PROB_MUTACAO:
-                mutation_sigma = get_mutation_sigma(gen)
-                child_z = mutate_latent(child_z, mutation_sigma)
-                if created_by == "crossover":
-                    created_by = "crossover+mutation"
-                else:
-                    created_by = "mutation"
-                num_mutation_offspring += 1
-                mutation_sigmas_this_gen.append(float(mutation_sigma))
-
-            new_pop.append(
-                Individual(
-                    individual_id=next_individual_id(id_counter),
-                    z=child_z,
-                    created_by=created_by,
-                    parent_ids=parent_ids,
-                    mutation_sigma=mutation_sigma,
-                    birth_generation=gen,
-                )
-            )
-
-        sigma_ref = float(np.mean(mutation_sigmas_this_gen)) if mutation_sigmas_this_gen else 0.0
+        cma_state = update_cmaes(cma_state, x_samples=x_samples, fitness=fitness)
+        sigma_ref = float(cma_state.sigma)
         generation_rows.append(
             aggregate_generation_metrics(
                 instance_id=instance_id,
@@ -1136,13 +1212,15 @@ def run_single_experiment(
                 eval_metrics=eval_metrics,
                 population=population,
                 mutation_sigma_reference=sigma_ref,
-                num_mutation_offspring=num_mutation_offspring,
-                num_crossover_offspring=num_crossover_offspring,
-                elite_count=ELITISM,
+                num_mutation_offspring=POPULACAO_INICIAL,
+                num_crossover_offspring=0,
+                elite_count=0,
             )
         )
 
-        population = new_pop
+        population, x_samples = sample_population_from_cmaes(
+            cma_state, latent_shape, generation=gen, id_counter=id_counter
+        )
         pbar.set_postfix(mean=f"{mean_f:.3f}", best=f"{best_f:.3f}", frac_changed=f"{frac_changed:.2f}")
 
         if torch.cuda.is_available():
@@ -1313,7 +1391,7 @@ def run_experiments() -> None:
 
 def print_usage_example() -> None:
     example = {
-        "run": "python3 genetico.py",
+        "run": "python3 cmaes.py",
         "inspect": [
             "cat <run_dir>/run_summary.csv",
             "head -n 5 <run_dir>/generation_summary.csv",
@@ -1325,5 +1403,5 @@ def print_usage_example() -> None:
 
 
 if __name__ == "__main__":
-    print("Executando LEI-Local (Sensibilidade: perturbacao minima) ->", OUTPUT_BASE)
+    print("Executando LEI-Local com otimizador CMA-ES ->", OUTPUT_BASE)
     run_experiments()

@@ -6,7 +6,9 @@ import json
 import logging
 import math
 import os
-import random
+import importlib.util
+import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -27,8 +29,16 @@ try:
 except Exception:
     pd = None
 
+# Evita colisão entre este arquivo (random.py) e o módulo padrão `random`.
+_stdlib_random_path = os.path.join(sysconfig.get_paths()["stdlib"], "random.py")
+_stdlib_random_spec = importlib.util.spec_from_file_location("random", _stdlib_random_path)
+if _stdlib_random_spec and _stdlib_random_spec.loader:
+    _stdlib_random_module = importlib.util.module_from_spec(_stdlib_random_spec)
+    _stdlib_random_spec.loader.exec_module(_stdlib_random_module)
+    sys.modules["random"] = _stdlib_random_module
+
+
 def set_global_seed(seed_value: int) -> None:
-    random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
@@ -76,14 +86,15 @@ CIFAR10_CLASSES = {
 print(f"Usando dispositivo: {DEVICE}")
 
 # ===========================
-# 1. Hiperparâmetros do GA
+# 1. Hiperparâmetros (Baseline Aleatório)
 # ===========================
 NUM_GERACOES = 200
-POPULACAO_INICIAL = 100
+POPULACAO_INICIAL = 100  # candidatos avaliados por iteração (inclui incumbente)
 
-ELITISM = 1
-PROB_MUTACAO = 0.95
-PROB_CROSSOVER = 0.05
+# Escala da amostragem aleatória local ao redor de z0
+SIGMA_LOCAL = 0.20
+SIGMA_MIN = 1e-6
+SIGMA_MAX = 3.0
 
 PIXEL_PERTURB_STD = 0.30
 
@@ -94,9 +105,12 @@ n_cols = int(np.ceil(np.sqrt(K_GRID)))
 n_rows = int(np.ceil(K_GRID / n_cols))
 
 N_SNAPSHOTS = 25
-OUTPUT_BASE = "outputs_lei_local_sensitivity"
+OUTPUT_BASE = "outputs_lei_local_sensitivity_random"
 
 SIGMA_INIT = 1.0
+
+# Orçamento de avaliações do classificador (comparável com GA/CMA-ES)
+CLASSIFIER_EVAL_BUDGET_IN_LOOP = NUM_GERACOES * POPULACAO_INICIAL  # ~20k por padrão
 
 # ===========================
 # 1.1. Hiperparâmetros LEI-Local (Sensibilidade)
@@ -126,8 +140,6 @@ MARGIN_GAMMA_AFTER = 0.2
 
 TRUST_REGION_RADIUS = 0.75
 TRUST_REGION_PENALTY = 2.0
-
-SIGMA_LOCAL = 0.20
 
 # ===========================
 # 1.2. Logging / Artefatos
@@ -215,7 +227,7 @@ def get_classifier_logits_and_class(pil_img: Image.Image) -> tuple[torch.Tensor,
 
 
 # ===========================
-# 3. Operadores Genéticos
+# 3. Operadores Aleatórios (Baseline)
 # ===========================
 
 @dataclass
@@ -233,42 +245,58 @@ def next_individual_id(counter: dict[str, int]) -> int:
     return counter["value"]
 
 
-def init_population_local(z0: torch.Tensor, size: int, id_counter: dict[str, int]) -> list[Individual]:
-    pop: list[Individual] = []
-    for _ in range(size):
-        noise = torch.randn_like(z0) * SIGMA_LOCAL
-        pop.append(
+@dataclass
+class RandomState:
+    center: np.ndarray
+    sigma: float
+    dim: int
+
+
+def flatten_latent(z: torch.Tensor) -> np.ndarray:
+    return z.detach().cpu().view(-1).numpy().astype(np.float32)
+
+
+def vector_to_latent(v: np.ndarray, latent_shape: tuple[int, ...]) -> torch.Tensor:
+    return torch.from_numpy(v.reshape(latent_shape)).to(DEVICE).float()
+
+
+def init_random_state(z0: torch.Tensor) -> RandomState:
+    x0 = flatten_latent(z0).astype(np.float64)
+    dim = int(x0.size)
+    return RandomState(
+        center=x0,
+        sigma=float(SIGMA_LOCAL),
+        dim=dim,
+    )
+
+
+def sample_population_random(
+    state: RandomState,
+    latent_shape: tuple[int, ...],
+    generation: int,
+    id_counter: dict[str, int],
+    batch_size: int,
+) -> tuple[list[Individual], np.ndarray]:
+    if batch_size < 1:
+        raise ValueError("batch_size precisa ser >= 1 para baseline aleatório.")
+
+    noise = np.random.randn(batch_size, state.dim)
+    x_samples = state.center[None, :] + state.sigma * noise
+
+    population: list[Individual] = []
+    for i in range(batch_size):
+        z_tensor = vector_to_latent(x_samples[i].astype(np.float32), latent_shape)
+        population.append(
             Individual(
                 individual_id=next_individual_id(id_counter),
-                z=(z0 + noise).to(DEVICE),
-                created_by="init",
-                parent_ids="",
-                mutation_sigma=float(SIGMA_LOCAL),
-                birth_generation=0,
+                z=z_tensor,
+                created_by="random_sample",
+                parent_ids="z0_center",
+                mutation_sigma=float(state.sigma),
+                birth_generation=int(generation),
             )
         )
-    return pop
-
-
-def get_mutation_sigma(gen: int) -> float:
-    factor = 0.05 + 0.95 * (1.0 - (gen - 1) / (NUM_GERACOES - 1))
-    max_std = PIXEL_PERTURB_STD * factor
-    return torch.rand(1, device=DEVICE).item() * max_std
-
-
-def mutate_latent(z: torch.Tensor, sigma: float) -> torch.Tensor:
-    noise = torch.randn_like(z) * sigma
-    return z + noise
-
-
-def crossover_latent(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-    alpha = torch.rand(1, device=DEVICE)
-    return alpha * z1 + (1.0 - alpha) * z2
-
-
-def tournament_selection_index(pop_size: int, fitness: np.ndarray, k: int = 2) -> int:
-    idxs = random.sample(range(pop_size), k)
-    return idxs[0] if fitness[idxs[0]] >= fitness[idxs[1]] else idxs[1]
+    return population, x_samples
 
 
 # ===========================
@@ -960,15 +988,16 @@ def run_single_experiment(
     config = {
         "seed": run_seed,
         "run_sequence_idx": run_sequence_idx,
+        "optimizer": "random_baseline",
         "NUM_GERACOES": NUM_GERACOES,
         "POPULACAO_INICIAL": POPULACAO_INICIAL,
-        "ELITISM": ELITISM,
-        "PROB_MUTACAO": PROB_MUTACAO,
-        "PROB_CROSSOVER": PROB_CROSSOVER,
         "PIXEL_PERTURB_STD": PIXEL_PERTURB_STD,
         "SIGMA_INIT": SIGMA_INIT,
         "SIGMA_LOCAL": SIGMA_LOCAL,
+        "SIGMA_MIN": SIGMA_MIN,
+        "SIGMA_MAX": SIGMA_MAX,
         "BATCH_EVAL_SIZE": BATCH_EVAL_SIZE,
+        "CLASSIFIER_EVAL_BUDGET_IN_LOOP": CLASSIFIER_EVAL_BUDGET_IN_LOOP,
         "ORIG_CLASS": target_class,
         "ORIG_CLASS_NAME": class_name(target_class),
         "P0": p0,
@@ -993,24 +1022,45 @@ def run_single_experiment(
         "run_id": run_id,
         "confidence_group": confidence_group,
     }
-    with (run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2)
 
-    gens_lin = list(np.linspace(1, NUM_GERACOES, N_SNAPSHOTS, dtype=int))
-    snapshot_gens = sorted(set(gens_lin + [NUM_GERACOES]))
+    total_iterations = int(np.ceil(CLASSIFIER_EVAL_BUDGET_IN_LOOP / POPULACAO_INICIAL))
+    total_iterations = max(total_iterations, 1)
+    gens_lin = list(np.linspace(1, total_iterations, N_SNAPSHOTS, dtype=int))
+    snapshot_gens = sorted(set(gens_lin + [total_iterations]))
+    config["NUM_ITERACOES_RANDOM"] = total_iterations
 
     id_counter = {"value": 0}
     eval_counter = {"value": 0}
 
-    population = init_population_local(z0, POPULACAO_INICIAL, id_counter)
+    random_state = init_random_state(z0)
+    config["RANDOM_DIM"] = random_state.dim
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(config, f, indent=2)
 
     grid_frames: list[Image.Image] = []
     individual_rows: list[dict[str, Any]] = []
     generation_rows: list[dict[str, Any]] = []
+    last_population: Optional[list[Individual]] = None
+    last_eval_metrics: Optional[dict[str, np.ndarray]] = None
+    last_generation = 0
 
-    pbar = tqdm(range(1, NUM_GERACOES + 1), desc="Geracoes")
+    pbar = tqdm(range(1, total_iterations + 1), desc="Iteracoes")
 
+    consumed_evals = 0
     for gen in pbar:
+        remaining = CLASSIFIER_EVAL_BUDGET_IN_LOOP - consumed_evals
+        if remaining <= 0:
+            break
+        batch_size = min(POPULACAO_INICIAL, remaining)
+        sigma_before = float(random_state.sigma)
+
+        population, x_samples = sample_population_random(
+            random_state,
+            latent_shape,
+            generation=gen,
+            id_counter=id_counter,
+            batch_size=batch_size,
+        )
         eval_metrics = evaluate_fitness_sensitivity(
             population, z0, target_class, latent_dim_sqrt
         )
@@ -1022,8 +1072,9 @@ def run_single_experiment(
         frac_changed = float(np.mean(eval_metrics["changed_class"] == 1))
 
         logger.info(
-            f"Geracao {gen:03d} - mean={mean_f:.4f}, best={best_f:.4f}, "
-            f"std={std_f:.4f}, frac_changed={frac_changed:.3f}"
+            f"Iteracao {gen:03d} - mean={mean_f:.4f}, best={best_f:.4f}, "
+            f"std={std_f:.4f}, frac_changed={frac_changed:.3f}, "
+            f"sigma={sigma_before:.5f}, batch={batch_size}, evals={consumed_evals + batch_size}/{CLASSIFIER_EVAL_BUDGET_IN_LOOP}"
         )
 
         append_individual_rows(
@@ -1068,101 +1119,59 @@ def run_single_experiment(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        elite_idxs = np.argsort(fitness)[-ELITISM:][::-1]
-        new_pop: list[Individual] = []
-
-        for ei in elite_idxs:
-            p = population[int(ei)]
-            new_pop.append(
-                Individual(
-                    individual_id=next_individual_id(id_counter),
-                    z=p.z.clone(),
-                    created_by="elite",
-                    parent_ids=str(p.individual_id),
-                    mutation_sigma=None,
-                    birth_generation=gen,
-                )
-            )
-
-        num_mutation_offspring = 0
-        num_crossover_offspring = 0
-        mutation_sigmas_this_gen: list[float] = []
-
-        while len(new_pop) < POPULACAO_INICIAL:
-            p1_idx = tournament_selection_index(len(population), fitness)
-            p2_idx = tournament_selection_index(len(population), fitness)
-
-            p1 = population[p1_idx]
-            p2 = population[p2_idx]
-
-            if random.random() < PROB_CROSSOVER:
-                child_z = crossover_latent(p1.z, p2.z)
-                created_by = "crossover"
-                parent_ids = f"{p1.individual_id}|{p2.individual_id}"
-                num_crossover_offspring += 1
-            else:
-                child_z = p1.z.clone()
-                created_by = "clone"
-                parent_ids = str(p1.individual_id)
-
-            mutation_sigma: Optional[float] = None
-            if random.random() < PROB_MUTACAO:
-                mutation_sigma = get_mutation_sigma(gen)
-                child_z = mutate_latent(child_z, mutation_sigma)
-                if created_by == "crossover":
-                    created_by = "crossover+mutation"
-                else:
-                    created_by = "mutation"
-                num_mutation_offspring += 1
-                mutation_sigmas_this_gen.append(float(mutation_sigma))
-
-            new_pop.append(
-                Individual(
-                    individual_id=next_individual_id(id_counter),
-                    z=child_z,
-                    created_by=created_by,
-                    parent_ids=parent_ids,
-                    mutation_sigma=mutation_sigma,
-                    birth_generation=gen,
-                )
-            )
-
-        sigma_ref = float(np.mean(mutation_sigmas_this_gen)) if mutation_sigmas_this_gen else 0.0
-        generation_rows.append(
-            aggregate_generation_metrics(
-                instance_id=instance_id,
-                run_id=run_id,
-                generation=gen,
-                eval_metrics=eval_metrics,
-                population=population,
-                mutation_sigma_reference=sigma_ref,
-                num_mutation_offspring=num_mutation_offspring,
-                num_crossover_offspring=num_crossover_offspring,
-                elite_count=ELITISM,
-            )
+        best_idx = int(np.argmax(fitness))
+        sigma_after = sigma_before
+        gen_row = aggregate_generation_metrics(
+            instance_id=instance_id,
+            run_id=run_id,
+            generation=gen,
+            eval_metrics=eval_metrics,
+            population=population,
+            mutation_sigma_reference=sigma_before,
+            num_mutation_offspring=batch_size,
+            num_crossover_offspring=0,
+            elite_count=0,
         )
+        gen_row["best_candidate_idx"] = int(best_idx)
+        gen_row["sigma_before"] = sigma_before
+        gen_row["sigma_after"] = sigma_after
+        gen_row["batch_size"] = int(batch_size)
+        gen_row["consumed_evals"] = int(consumed_evals + batch_size)
+        generation_rows.append(gen_row)
 
-        population = new_pop
-        pbar.set_postfix(mean=f"{mean_f:.3f}", best=f"{best_f:.3f}", frac_changed=f"{frac_changed:.2f}")
+        consumed_evals += batch_size
+        last_population = population
+        last_eval_metrics = eval_metrics
+        last_generation = gen
+
+        pbar.set_postfix(
+            mean=f"{mean_f:.3f}",
+            best=f"{best_f:.3f}",
+            frac_changed=f"{frac_changed:.2f}",
+            sigma=f"{sigma_after:.4f}",
+            evals=f"{consumed_evals}/{CLASSIFIER_EVAL_BUDGET_IN_LOOP}",
+        )
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if last_population is None or last_eval_metrics is None:
+        raise RuntimeError("Nenhuma avaliação foi executada no baseline aleatório.")
+
+    population = last_population
+    final_metrics = last_eval_metrics
     torch.save(population, run_dir / "final_population.pt")
 
-    # Mantém compatibilidade com fluxo atual: avalia população final ainda não avaliada no loop.
-    final_metrics = evaluate_fitness_sensitivity(
-        population, z0, target_class, latent_dim_sqrt
-    )
+    # Não faz avaliação extra do classificador; reaproveita última população para respeitar orçamento.
     append_individual_rows(
         rows=individual_rows,
         instance_id=instance_id,
         run_id=run_id,
-        generation=NUM_GERACOES,
+        generation=last_generation,
         population=population,
         eval_metrics=final_metrics,
         eval_counter=eval_counter,
-        eval_stage="final_eval",
+        eval_stage="final_eval_reuse",
         recon_prefix="best_final_eval" if SAVE_RECONSTRUCTION_PATH_IN_LOG else None,
     )
 
@@ -1313,7 +1322,7 @@ def run_experiments() -> None:
 
 def print_usage_example() -> None:
     example = {
-        "run": "python3 genetico.py",
+        "run": "python3 random.py",
         "inspect": [
             "cat <run_dir>/run_summary.csv",
             "head -n 5 <run_dir>/generation_summary.csv",
@@ -1325,5 +1334,5 @@ def print_usage_example() -> None:
 
 
 if __name__ == "__main__":
-    print("Executando LEI-Local (Sensibilidade: perturbacao minima) ->", OUTPUT_BASE)
+    print("Executando LEI-Local com baseline aleatorio ->", OUTPUT_BASE)
     run_experiments()
