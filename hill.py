@@ -27,6 +27,47 @@ try:
 except Exception:
     pd = None
 
+# ---------------------------
+# Hugging Face cache/network
+# ---------------------------
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+
+PREFER_LOCAL_HF_CACHE = True
+
+
+def load_vae_with_cache_fallback(model_name: str) -> AutoencoderKL:
+    if PREFER_LOCAL_HF_CACHE:
+        try:
+            return AutoencoderKL.from_pretrained(model_name, local_files_only=True)
+        except Exception as e:
+            print(f"[HF] Cache local do VAE indisponível, tentando internet: {e}")
+    return AutoencoderKL.from_pretrained(model_name)
+
+
+def load_processor_with_cache_fallback(model_name: str, size: int = 224, use_fast: bool = True) -> AutoImageProcessor:
+    if PREFER_LOCAL_HF_CACHE:
+        try:
+            return AutoImageProcessor.from_pretrained(
+                model_name,
+                size=size,
+                use_fast=use_fast,
+                local_files_only=True,
+            )
+        except Exception as e:
+            print(f"[HF] Cache local do processor indisponível, tentando internet: {e}")
+    return AutoImageProcessor.from_pretrained(model_name, size=size, use_fast=use_fast)
+
+
+def load_classifier_with_cache_fallback(model_name: str) -> AutoModelForImageClassification:
+    if PREFER_LOCAL_HF_CACHE:
+        try:
+            return AutoModelForImageClassification.from_pretrained(model_name, local_files_only=True)
+        except Exception as e:
+            print(f"[HF] Cache local do classificador indisponível, tentando internet: {e}")
+    return AutoModelForImageClassification.from_pretrained(model_name)
+
+
 def set_global_seed(seed_value: int) -> None:
     random.seed(seed_value)
     np.random.seed(seed_value)
@@ -42,11 +83,14 @@ set_global_seed(BASE_SEED)
 # ===========================
 # 0. Preparação: AutoencoderKL 32x32 Genérico + Classificador CIFAR-10
 # ===========================
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+CUDA_DEVICE_INDEX = int(os.environ.get("LEI_CUDA_DEVICE", "0"))
+DEVICE = torch.device(
+    f"cuda:{CUDA_DEVICE_INDEX}" if torch.cuda.is_available() else "cpu"
+)
 
 # Carrega VAE genérico 32x32 (modelo DCAE 32x32 treinado em ImageNet)
 VAE_MODEL_NAME = "stabilityai/sd-vae-ft-ema"
-vae = AutoencoderKL.from_pretrained(VAE_MODEL_NAME).to(DEVICE)
+vae = load_vae_with_cache_fallback(VAE_MODEL_NAME).to(DEVICE)
 vae.eval()
 VAE_SCALING_FACTOR = float(getattr(vae.config, "scaling_factor", 1.0))
 
@@ -54,10 +98,8 @@ sample_size = int(vae.config.sample_size)  # deve ser 32
 
 # Classificador CIFAR-10 pré-treinado
 MODEL_NAME = "nateraw/vit-base-patch16-224-cifar10"
-feature_extractor = AutoImageProcessor.from_pretrained(
-    MODEL_NAME, size=224, use_fast=True
-)
-clf_model = AutoModelForImageClassification.from_pretrained(MODEL_NAME).to(DEVICE)
+feature_extractor = load_processor_with_cache_fallback(MODEL_NAME, size=224, use_fast=True)
+clf_model = load_classifier_with_cache_fallback(MODEL_NAME).to(DEVICE)
 clf_model.eval()
 
 CIFAR10_CLASSES = {
