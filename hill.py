@@ -87,6 +87,7 @@ CUDA_DEVICE_INDEX = int(os.environ.get("LEI_CUDA_DEVICE", "0"))
 DEVICE = torch.device(
     f"cuda:{CUDA_DEVICE_INDEX}" if torch.cuda.is_available() else "cpu"
 )
+CUDA_AVAILABLE = torch.cuda.is_available()
 
 # Carrega VAE genérico 32x32 (modelo DCAE 32x32 treinado em ImageNet)
 VAE_MODEL_NAME = "stabilityai/sd-vae-ft-ema"
@@ -188,6 +189,12 @@ Z_VECTOR_HEAD_SIZE = 16       # Alternativa compacta: primeiros N elementos
 # ===========================
 
 to_tensor_01 = transforms.ToTensor()
+to_pil_image = transforms.ToPILImage()
+
+
+def maybe_empty_cuda_cache() -> None:
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
 
 
 def prepare_classifier_inputs(images: Any) -> torch.Tensor:
@@ -200,16 +207,15 @@ def latent_batch_to_pil(batch_z: torch.Tensor) -> list[Image.Image]:
     batch_z: [B, 4, 8, 8] (no DEVICE).
     Faz decode no DEVICE, move para CPU e converte para PIL 224x224.
     """
-    with torch.no_grad():
+    with torch.inference_mode():
         recon = vae.decode(batch_z / VAE_SCALING_FACTOR).sample  # [B,3,32,32], [-1,+1]
     recon = (recon.clamp(-1, 1) + 1.0) / 2.0
     recon_cpu = recon.cpu()
 
     pil_list: list[Image.Image] = []
-    to_pil_local = transforms.ToPILImage()
     for i in range(recon_cpu.shape[0]):
         img_rgb = recon_cpu[i]
-        pil_32 = to_pil_local(img_rgb)
+        pil_32 = to_pil_image(img_rgb)
         pil = pil_32.resize((224, 224))
         pil_list.append(pil)
 
@@ -226,7 +232,7 @@ def encode_image_to_latent(pil_img: Image.Image) -> torch.Tensor:
     x = to_tensor_01(pil_32).unsqueeze(0).to(DEVICE)
     x = 2.0 * x - 1.0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         posterior = vae.encode(x)
         z = posterior.latent_dist.mean * VAE_SCALING_FACTOR
 
@@ -243,19 +249,17 @@ def get_latent_stats(z: torch.Tensor) -> tuple[tuple[int, ...], int, float]:
 def get_classifier_logits_and_class(pil_img: Image.Image) -> tuple[torch.Tensor, float, int]:
     x = prepare_classifier_inputs(pil_img)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = clf_model(x)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         probs = F.softmax(logits, dim=1)
 
     logits0 = logits[0].detach().cpu()
-    probs_np = probs.cpu().numpy()[0]
-    pred_class = int(np.argmax(probs_np))
-    p0 = float(probs_np[pred_class])
+    pred_class = int(torch.argmax(probs, dim=1)[0].item())
+    p0 = float(probs[0, pred_class].item())
 
     del logits, probs, x
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    maybe_empty_cuda_cache()
 
     return logits0, p0, pred_class
 
@@ -403,7 +407,7 @@ def evaluate_fitness_sensitivity(
         pil_imgs = latent_batch_to_pil(batch_z)
         inputs = prepare_classifier_inputs(pil_imgs)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = clf_model(inputs)
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
             probs = F.softmax(logits, dim=1)
@@ -497,8 +501,7 @@ def evaluate_fitness_sensitivity(
             constraint_penalty,
             batch_fitness,
         )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        maybe_empty_cuda_cache()
 
     return metrics
 
@@ -549,7 +552,7 @@ def compute_population_diversity(population: list[Individual]) -> tuple[float, f
     if n < 2:
         return float("nan"), centroid_mean
 
-    with torch.no_grad():
+    with torch.inference_mode():
         # O(n^2) mas viável para população atual (~100)
         dmat = torch.cdist(z_stack, z_stack, p=2)
         tri = torch.triu_indices(n, n, offset=1)
@@ -1157,15 +1160,14 @@ def run_single_experiment(
         if gen % 5 == 0:
             best_idx_5 = int(np.argmax(fitness))
             best_tensor_5 = population[best_idx_5].z
-            with torch.no_grad():
+            with torch.inference_mode():
                 recon_5 = vae.decode(best_tensor_5.unsqueeze(0) / VAE_SCALING_FACTOR).sample
             recon_5 = (recon_5.clamp(-1, 1) + 1.0) / 2.0
             recon_cpu_5 = recon_5.cpu().squeeze(0)
-            pil_best_5 = transforms.ToPILImage()(recon_cpu_5).resize((224, 224))
+            pil_best_5 = to_pil_image(recon_cpu_5).resize((224, 224))
             pil_best_5.save(run_dir / f"best_gen_{gen}.png")
             del recon_5, recon_cpu_5, pil_best_5
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            maybe_empty_cuda_cache()
 
         if gen in snapshot_gens:
             sorted_idxs = np.argsort(-fitness)
@@ -1176,13 +1178,11 @@ def run_single_experiment(
             batch_z = torch.stack(selected, dim=0).to(DEVICE)
             pil_imgs = latent_batch_to_pil(batch_z)
             for j, pil in enumerate(pil_imgs):
-                pil_resized = pil.resize((W, H))
                 row, col = divmod(j, n_cols)
-                grid_img.paste(pil_resized, (col * W, row * H))
+                grid_img.paste(pil, (col * W, row * H))
             grid_frames.append(grid_img)
-            del batch_z, pil_imgs, pil_resized, grid_img
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            del batch_z, pil_imgs, grid_img
+            maybe_empty_cuda_cache()
 
         hill_state, best_idx, accepted = update_hill_state(hill_state, x_samples=x_samples, fitness=fitness)
         sigma_after = float(hill_state.sigma)
@@ -1219,8 +1219,7 @@ def run_single_experiment(
             evals=f"{consumed_evals}/{CLASSIFIER_EVAL_BUDGET_IN_LOOP}",
         )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        maybe_empty_cuda_cache()
 
     if last_population is None or last_eval_metrics is None:
         raise RuntimeError("Nenhuma avaliação foi executada no Hill Climbing.")
@@ -1245,11 +1244,11 @@ def run_single_experiment(
     best_idx_final = int(np.argmax(final_metrics["fitness_total"]))
     best_tensor_final = population[best_idx_final].z
 
-    with torch.no_grad():
+    with torch.inference_mode():
         recon_final = vae.decode(best_tensor_final.unsqueeze(0) / VAE_SCALING_FACTOR).sample
     recon_final = (recon_final.clamp(-1, 1) + 1.0) / 2.0
     recon_cpu_final = recon_final.cpu().squeeze(0)
-    pil_best_final = transforms.ToPILImage()(recon_cpu_final).resize((224, 224))
+    pil_best_final = to_pil_image(recon_cpu_final).resize((224, 224))
     pil_best_final.save(run_dir / "best_final.png")
 
     delta_z_best = (best_tensor_final - z0.to(best_tensor_final.device)).detach().cpu().numpy()

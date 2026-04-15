@@ -1,2 +1,6 @@
 __pycache__/
 outputs_lei_local_sensitivity/
+outputs_lei_local_sensitivity_cmaes/
+outputs_lei_local_sensitivity_hill/
+outputs_lei_local_sensitivity_random/
+
